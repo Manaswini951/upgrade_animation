@@ -6,20 +6,19 @@ import streamlit as st
 from PIL import Image
 
 st.set_page_config(
-    page_title="10-in-1 Character Animator",
+    page_title="Custom Color-Motion Character Animator",
     page_icon="🎨",
     layout="wide",
 )
 
-st.title("🎨 Advanced Hand-Drawn Character Animator")
+st.title("🎨 Custom Motion-per-Color Character Animator")
 st.write(
-    "Upload a character drawing. Colored markers are automatically rigged into "
-    "hierarchical body components (Head, Torso, Arms, Legs) to generate coordinated, "
-    "multi-part animations like Walking and Laughing."
+    "Upload a character drawing. Assign custom motion behaviors to each detected color "
+    "marker in your drawing (e.g., Red = Walk, Yellow = Laugh, Blue = Wave)."
 )
 
 # ============================================================
-# ACCURATE HSV COLOR BOUNDS WITH RED/VIOLET SEPARATION
+# ACCURATE HSV COLOR BOUNDS
 # ============================================================
 
 COLOR_RANGES = {
@@ -36,12 +35,24 @@ COLOR_RANGES = {
     "Pink / Magenta": [(np.array([156, 50, 40]), np.array([171, 255, 255]))],
 }
 
+ALL_MOTIONS = [
+    "None (Static)",
+    "Advanced Walk",
+    "Belly Laugh",
+    "Natural Sway",
+    "Playful Bounce",
+    "Dynamic Wave",
+    "Rapid Twitch",
+    "Breathing Pulse",
+    "Curved Smile",
+    "Curious Tilt",
+    "Jitter / Shiver",
+    "Wind Flutter",
+]
+
 
 def extract_accurate_colors(image):
-    """
-    Scans image using defined HSV ranges to eliminate false overlaps
-    between adjacent spectrums (e.g., Red vs. Magenta/Violet).
-    """
+    """Scans image using defined HSV ranges to detect color regions."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     total_pixels = image.shape[0] * image.shape[1]
     detected = []
@@ -55,63 +66,66 @@ def extract_accurate_colors(image):
         pixel_count = cv2.countNonZero(combined_mask)
         coverage = (pixel_count / total_pixels) * 100
 
-        # Ignore tiny speckles (< 0.08% of total area)
-        if coverage > 0.08:
+        if coverage > 0.08:  # Ignore tiny speckles
             detected.append({
-                "label": f"{name} ({coverage:.2f}% area)",
                 "name": name,
+                "coverage": coverage,
                 "mask": combined_mask,
             })
 
     return detected
 
 
-def detect_parts_from_masks(chosen_colors, image_shape):
-    h, w = image_shape[:2]
-    combined = np.zeros((h, w), dtype=np.uint8)
+def detect_parts_per_color(detected_colors):
+    """Extracts connected components for each distinct color region."""
+    color_parts_map = {}
 
-    for color_info in chosen_colors:
-        combined = cv2.bitwise_or(combined, color_info["mask"])
+    for color_info in detected_colors:
+        color_name = color_info["name"]
+        mask = color_info["mask"]
 
-    clean_mask = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
+        clean_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
 
-    parts = []
-    min_area = max(40, int(h * w * 0.0001))
+        parts = []
+        min_area = 40
 
-    for i in range(1, num_labels):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < min_area:
-            continue
+        for i in range(1, num_labels):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
 
-        comp = (labels == i).astype(np.uint8) * 255
-        ys, xs = np.where(comp > 0)
-        if len(xs) < 10:
-            continue
+            comp = (labels == i).astype(np.uint8) * 255
+            ys, xs = np.where(comp > 0)
+            if len(xs) < 10:
+                continue
 
-        base_y = float(np.max(ys))
-        base_x = float(np.mean(xs[ys == int(base_y)]))
+            base_y = float(np.max(ys))
+            base_x = float(np.mean(xs[ys == int(base_y)]))
 
-        tip_y = float(np.min(ys))
-        tip_x = float(np.mean(xs[ys == int(tip_y)]))
+            tip_y = float(np.min(ys))
+            tip_x = float(np.mean(xs[ys == int(tip_y)]))
 
-        length = max(10.0, float(math.hypot(tip_x - base_x, tip_y - base_y)))
-        expanded = cv2.dilate(comp, np.ones((5, 5), np.uint8), iterations=1)
+            length = max(10.0, float(math.hypot(tip_x - base_x, tip_y - base_y)))
+            expanded = cv2.dilate(comp, np.ones((5, 5), np.uint8), iterations=1)
 
-        parts.append({
-            "mask": expanded > 0,
-            "base": (base_x, base_y),
-            "tip": (tip_x, tip_y),
-            "center": (float(np.mean(xs)), float(np.mean(ys))),
-            "length": length,
-            "area": area,
-        })
+            parts.append({
+                "mask": expanded > 0,
+                "base": (base_x, base_y),
+                "tip": (tip_x, tip_y),
+                "center": (float(np.mean(xs)), float(np.mean(ys))),
+                "length": length,
+                "area": area,
+            })
 
-    parts.sort(key=lambda p: p["area"], reverse=True)
-    return parts
+        if parts:
+            color_parts_map[color_name] = parts
+
+    return color_parts_map
 
 
-def classify_body_parts(parts, image_shape):
+def classify_parts_by_position(parts, image_shape):
+    """Helper to classify parts spatially for motions that require spatial hierarchy."""
     h, _ = image_shape[:2]
     rigged = {"head": [], "torso": [], "arms": [], "legs": []}
 
@@ -130,77 +144,73 @@ def classify_body_parts(parts, image_shape):
     return rigged
 
 
-def animate_frame_elastic(original, parts, motion_type, frame_index, total_frames, intensity):
-    h, w = original.shape[:2]
-    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    map_x = grid_x.copy()
-    map_y = grid_y.copy()
+def apply_single_motion(map_x, map_y, grid_x, grid_y, parts, motion_type, frame_index, total_frames, intensity, image_shape):
+    """Applies displacement deformations for a specific motion type onto given part masks."""
+    if motion_type == "None (Static)" or not parts:
+        return
 
     phase = 2.0 * math.pi * float(frame_index) / float(total_frames)
     sine = math.sin(phase)
     cosine = math.cos(phase)
+    h, w = image_shape[:2]
 
-    rigged = classify_body_parts(parts, (h, w))
+    # Special handling for hierarchical multi-part motions
+    if motion_type in ["Advanced Walk", "Belly Laugh"]:
+        rigged = classify_parts_by_position(parts, image_shape)
 
-    if motion_type == "Advanced Walk":
-        stride_shift = (float(frame_index) / total_frames) * (w * 0.12)
-        vertical_bob = abs(math.sin(phase * 2.0)) * (intensity * 0.4)
+        if motion_type == "Advanced Walk":
+            stride_shift = (float(frame_index) / total_frames) * (w * 0.12)
+            vertical_bob = abs(math.sin(phase * 2.0)) * (intensity * 0.4)
 
-        map_x -= stride_shift
-        map_y += vertical_bob
+            map_x -= stride_shift
+            map_y += vertical_bob
 
-        for idx, leg in enumerate(rigged["legs"]):
-            mask = leg["mask"]
-            bx, by = leg["base"]
-            leg_phase = phase if idx % 2 == 0 else phase + math.pi
+            for idx, leg in enumerate(rigged["legs"]):
+                mask = leg["mask"]
+                bx, by = leg["base"]
+                leg_phase = phase if idx % 2 == 0 else phase + math.pi
+                dist = np.sqrt((grid_x - bx) ** 2 + (grid_y - by) ** 2)
+                weight = np.power(np.clip(dist / leg["length"], 0.0, 1.0), 1.2)
 
-            dist = np.sqrt((grid_x - bx) ** 2 + (grid_y - by) ** 2)
-            weight = np.power(np.clip(dist / leg["length"], 0.0, 1.0), 1.2)
+                dx = math.sin(leg_phase) * (intensity * 1.5) * weight
+                dy = np.maximum(0.0, -math.cos(leg_phase)) * (intensity * 0.8) * weight
+                map_x[mask] -= dx[mask]
+                map_y[mask] -= dy[mask]
 
-            dx = math.sin(leg_phase) * (intensity * 1.5) * weight
-            dy = np.maximum(0.0, -math.cos(leg_phase)) * (intensity * 0.8) * weight
-            map_x[mask] -= dx[mask]
-            map_y[mask] -= dy[mask]
+            for idx, arm in enumerate(rigged["arms"]):
+                mask = arm["mask"]
+                bx, by = arm["base"]
+                arm_phase = phase + math.pi if idx % 2 == 0 else phase
+                dist = np.sqrt((grid_x - bx) ** 2 + (grid_y - by) ** 2)
+                weight = np.power(np.clip(dist / arm["length"], 0.0, 1.0), 1.0)
 
-        for idx, arm in enumerate(rigged["arms"]):
-            mask = arm["mask"]
-            bx, by = arm["base"]
-            arm_phase = phase + math.pi if idx % 2 == 0 else phase
+                dx = math.sin(arm_phase) * (intensity * 1.2) * weight
+                map_x[mask] -= dx[mask]
 
-            dist = np.sqrt((grid_x - bx) ** 2 + (grid_y - by) ** 2)
-            weight = np.power(np.clip(dist / arm["length"], 0.0, 1.0), 1.0)
+        elif motion_type == "Belly Laugh":
+            fast_tremor = math.sin(phase * 6.0) * (intensity * 0.5)
+            slow_nod = math.sin(phase) * (intensity * 0.3)
 
-            dx = math.sin(arm_phase) * (intensity * 1.2) * weight
-            map_x[mask] -= dx[mask]
+            for torso in rigged["torso"]:
+                mask = torso["mask"]
+                cx, cy = torso["center"]
+                scale = 1.0 + (fast_tremor * 0.02)
+                dx = (grid_x - cx) * (scale - 1.0)
+                dy = (grid_y - cy) * (scale - 1.0) + fast_tremor
+                map_x[mask] -= dx[mask]
+                map_y[mask] -= dy[mask]
 
-    elif motion_type == "Belly Laugh":
-        fast_tremor = math.sin(phase * 6.0) * (intensity * 0.5)
-        slow_nod = math.sin(phase) * (intensity * 0.3)
+            for head in rigged["head"]:
+                mask = head["mask"]
+                bx, by = head["base"]
+                dist = np.sqrt((grid_x - bx) ** 2 + (grid_y - by) ** 2)
+                weight = np.clip(dist / max(10.0, head["length"]), 0.0, 1.0)
+                dy = (slow_nod - abs(fast_tremor * 0.5)) * weight
+                dx = fast_tremor * 0.3 * weight
+                map_x[mask] -= dx[mask]
+                map_y[mask] -= dy[mask]
 
-        for torso in rigged["torso"]:
-            mask = torso["mask"]
-            cx, cy = torso["center"]
-
-            scale = 1.0 + (fast_tremor * 0.02)
-            dx = (grid_x - cx) * (scale - 1.0)
-            dy = (grid_y - cy) * (scale - 1.0) + fast_tremor
-
-            map_x[mask] -= dx[mask]
-            map_y[mask] -= dy[mask]
-
-        for head in rigged["head"]:
-            mask = head["mask"]
-            bx, by = head["base"]
-
-            dist = np.sqrt((grid_x - bx) ** 2 + (grid_y - by) ** 2)
-            weight = np.clip(dist / max(10.0, head["length"]), 0.0, 1.0)
-
-            dy = (slow_nod - abs(fast_tremor * 0.5)) * weight
-            dx = fast_tremor * 0.3 * weight
-
-            map_x[mask] -= dx[mask]
-            map_y[mask] -= dy[mask]
-
+    # Standard per-part deformations
     else:
         for idx, part in enumerate(parts):
             mask = part["mask"]
@@ -263,6 +273,18 @@ def animate_frame_elastic(original, parts, motion_type, frame_index, total_frame
                 dx = wave_travel * (intensity * 0.9) * side * np.power(norm_dist, 1.2)
                 map_x[mask] -= dx[mask]
 
+
+def animate_frame_custom(original, color_parts_map, color_motion_assignments, frame_index, total_frames, intensity):
+    """Combines deformations across all custom color-motion mappings."""
+    h, w = original.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    map_x = grid_x.copy()
+    map_y = grid_y.copy()
+
+    for color_name, parts in color_parts_map.items():
+        motion = color_motion_assignments.get(color_name, "None (Static)")
+        apply_single_motion(map_x, map_y, grid_x, grid_y, parts, motion, frame_index, total_frames, intensity, (h, w))
+
     warped = cv2.remap(original, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
     return warped
 
@@ -274,22 +296,8 @@ def build_gif(frames, duration=50):
     return buf.getvalue()
 
 
-ALL_MOTIONS = [
-    "Advanced Walk",
-    "Belly Laugh",
-    "Natural Sway",
-    "Playful Bounce",
-    "Dynamic Wave",
-    "Rapid Twitch",
-    "Breathing Pulse",
-    "Curved Smile",
-    "Curious Tilt",
-    "Jitter / Shiver",
-    "Wind Flutter",
-]
-
 # ============================================================
-# STREAMLIT INTERFACE
+# STREAMLIT UI
 # ============================================================
 
 uploaded_file = st.file_uploader("Upload character drawing", type=["jpg", "jpeg", "png", "webp"])
@@ -309,116 +317,72 @@ if uploaded_file is not None:
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
         detected_colors = extract_accurate_colors(img)
+        color_parts_map = detect_parts_per_color(detected_colors)
 
-        st.sidebar.header("Controls")
-        chosen_colors = []
-        if detected_colors:
-            color_dict = {c["label"]: c for c in detected_colors}
-            selected_labels = st.sidebar.multiselect(
-                "Marker Colors to Animate",
-                list(color_dict.keys()),
-                default=[list(color_dict.keys())[0]],
-            )
-            chosen_colors = [color_dict[lbl] for lbl in selected_labels]
+        st.sidebar.header("⚙️ Motion Assignment Dashboard")
+        color_motion_assignments = {}
+
+        if color_parts_map:
+            st.sidebar.write("Assign a specific motion to each detected color part:")
+            
+            # Default preset motions for intuitive auto-assignment
+            presets = ["Advanced Walk", "Belly Laugh", "Dynamic Wave", "Playful Bounce", "Natural Sway"]
+            
+            for idx, (color_name, parts) in enumerate(color_parts_map.items()):
+                default_motion = presets[idx % len(presets)]
+                selected_motion = st.sidebar.selectbox(
+                    f"Color: {color_name} ({len(parts)} regions)",
+                    ALL_MOTIONS,
+                    index=ALL_MOTIONS.index(default_motion),
+                    key=f"motion_{color_name}",
+                )
+                color_motion_assignments[color_name] = selected_motion
         else:
-            st.sidebar.warning("No distinct marker colors detected.")
+            st.sidebar.warning("No distinct colored markers detected.")
 
         intensity = float(st.sidebar.slider("Motion Strength", 4, 30, 12))
 
-        parts = detect_parts_from_masks(chosen_colors, img.shape) if chosen_colors else []
-        classified = classify_body_parts(parts, img.shape) if parts else {}
-
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Original Image")
+            st.subheader("Original Drawing")
             st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with col2:
-            st.subheader(f"Rigged Skeleton ({len(parts)} regions detected)")
+            st.subheader("Detected Color Regions")
             preview = img.copy()
 
-            colors_map = {
-                "head": (255, 0, 0),
-                "torso": (0, 255, 255),
-                "arms": (0, 255, 0),
-                "legs": (0, 0, 255),
-            }
-
-            for group, group_parts in classified.items():
-                for p in group_parts:
-                    cv2.circle(preview, (int(p["base"][0]), int(p["base"][1])), 6, colors_map[group], -1)
-                    cv2.circle(preview, (int(p["tip"][0]), int(p["tip"][1])), 4, (255, 255, 255), -1)
-                    cv2.line(
-                        preview,
-                        (int(p["base"][0]), int(p["base"][1])),
-                        (int(p["tip"][0]), int(p["tip"][1])),
-                        colors_map[group],
-                        2,
-                    )
+            for color_name, parts in color_parts_map.items():
+                for p in parts:
+                    cv2.circle(preview, (int(p["base"][0]), int(p["base"][1])), 6, (0, 255, 0), -1)
+                    cv2.circle(preview, (int(p["tip"][0]), int(p["tip"][1])), 4, (0, 0, 255), -1)
+                    cv2.line(preview, (int(p["base"][0]), int(p["base"][1])), (int(p["tip"][0]), int(p["tip"][1])), (255, 255, 0), 2)
 
             st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
-            st.caption("🔵 Head | 🟡 Torso | 🟢 Arms | 🔴 Legs")
 
         st.markdown("---")
 
-        btn_col1, btn_col2 = st.columns([1, 1])
-        with btn_col1:
-            generate_all = st.button("✨ Generate All Motions", type="primary", disabled=(len(parts) == 0))
-        with btn_col2:
-            single_motion = st.selectbox("Select Single Motion:", ALL_MOTIONS)
-            generate_single = st.button(f"Render '{single_motion}'", disabled=(len(parts) == 0))
+        render_btn = st.button("✨ Render Custom Composition", type="primary", disabled=(len(color_parts_map) == 0))
 
-        # Render All
-        if generate_all:
-            progress = st.progress(0, text="Rendering animations...")
-            results = []
-
-            for idx, motion_name in enumerate(ALL_MOTIONS):
+        if render_btn:
+            with st.spinner("Calculating composite motion vectors across all assigned colors..."):
                 frames = []
                 for i in range(16):
-                    warped = animate_frame_elastic(img, parts, motion_name, i, 16, intensity)
-                    rgb_frame = np.ascontiguousarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
-                    frames.append(Image.fromarray(rgb_frame))
-                gif_bytes = build_gif(frames, duration=50)
-                results.append((motion_name, gif_bytes))
-                progress.progress((idx + 1) / len(ALL_MOTIONS))
-
-            progress.empty()
-            st.success("All motions generated!")
-
-            for row_start in range(0, len(results), 3):
-                row_cols = st.columns(3)
-                for col_idx in range(3):
-                    item_idx = row_start + col_idx
-                    if item_idx < len(results):
-                        name, gif_data = results[item_idx]
-                        with row_cols[col_idx]:
-                            st.markdown(f"#### {item_idx + 1}. {name}")
-                            st.image(gif_data, use_container_width=True)
-                            st.download_button(
-                                f"Download {name}",
-                                data=gif_data,
-                                file_name=f"{name.lower().replace(' ', '_')}.gif",
-                                mime="image/gif",
-                                key=f"dl_{item_idx}",
-                            )
-
-        # Render Single
-        elif generate_single:
-            with st.spinner(f"Rendering {single_motion}..."):
-                frames = []
-                for i in range(16):
-                    warped = animate_frame_elastic(img, parts, single_motion, i, 16, intensity)
+                    warped = animate_frame_custom(img, color_parts_map, color_motion_assignments, i, 16, intensity)
                     rgb_frame = np.ascontiguousarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
                     frames.append(Image.fromarray(rgb_frame))
                 gif_bytes = build_gif(frames, duration=50)
 
-            st.subheader(f"Result: {single_motion}")
+            st.subheader("🎬 Custom Composite Animation Result")
             st.image(gif_bytes, width=500)
+            
+            # Show active motion mapping summary
+            summary_str = " | ".join([f"**{c}**: {m}" for c, m in color_motion_assignments.items()])
+            st.caption(f"Active Mappings: {summary_str}")
+
             st.download_button(
-                f"Download {single_motion} GIF",
+                "Download Animation GIF",
                 data=gif_bytes,
-                file_name=f"{single_motion.lower().replace(' ', '_')}.gif",
+                file_name="custom_character_animation.gif",
                 mime="image/gif",
             )
 
