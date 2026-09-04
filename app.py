@@ -42,7 +42,7 @@ def extract_accurate_colors(image):
     Scans image using defined HSV ranges to eliminate false overlaps
     between adjacent spectrums (e.g., Red vs. Magenta/Violet).
     """
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR_HSV)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     total_pixels = image.shape[0] * image.shape[1]
     detected = []
 
