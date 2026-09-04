@@ -1,4 +1,3 @@
-import base64
 import io
 import math
 import cv2
@@ -19,89 +18,66 @@ st.write(
     "multi-part animations like Walking and Laughing."
 )
 
+# ============================================================
+# ACCURATE HSV COLOR BOUNDS WITH RED/VIOLET SEPARATION
+# ============================================================
 
-def get_color_name(rgb):
-    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
-    pixel = np.uint8([[[b, g, r]]])
-    hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
-    hue, sat = int(hsv[0]), int(hsv[1])
-
-    if sat < 35:
-        return "Neutral"
-    if hue < 8 or hue >= 172:
-        return "Red"
-    elif 8 <= hue < 22:
-        return "Orange"
-    elif 22 <= hue < 35:
-        return "Yellow"
-    elif 35 <= hue < 85:
-        return "Green"
-    elif 85 <= hue < 130:
-        return "Blue"
-    elif 130 <= hue < 155:
-        return "Purple"
-    elif 155 <= hue < 172:
-        return "Pink"
-    return "Accent"
+COLOR_RANGES = {
+    "Red": [
+        (np.array([0, 70, 50]), np.array([8, 255, 255])),
+        (np.array([172, 70, 50]), np.array([180, 255, 255])),
+    ],
+    "Orange": [(np.array([9, 70, 50]), np.array([20, 255, 255]))],
+    "Yellow": [(np.array([21, 70, 50]), np.array([34, 255, 255]))],
+    "Green": [(np.array([35, 50, 40]), np.array([84, 255, 255]))],
+    "Cyan / Light Blue": [(np.array([85, 50, 40]), np.array([105, 255, 255]))],
+    "Blue": [(np.array([106, 50, 40]), np.array([130, 255, 255]))],
+    "Purple / Violet": [(np.array([131, 50, 40]), np.array([155, 255, 255]))],
+    "Pink / Magenta": [(np.array([156, 50, 40]), np.array([171, 255, 255]))],
+}
 
 
-def extract_dominant_colors(image, num_clusters=5):
-    try:
-        small = cv2.resize(image, (120, 120), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        valid = (gray > 45) & (gray < 235)
-        pixels = small[valid].reshape(-1, 3).astype(np.float32)
+def extract_accurate_colors(image):
+    """
+    Scans image using defined HSV ranges to eliminate false overlaps
+    between adjacent spectrums (e.g., Red vs. Magenta/Violet).
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR_HSV)
+    total_pixels = image.shape[0] * image.shape[1]
+    detected = []
 
-        if len(pixels) < 50:
-            return []
+    for name, ranges in COLOR_RANGES.items():
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lower, upper in ranges:
+            mask = cv2.inRange(hsv, lower, upper)
+            combined_mask = cv2.bitwise_or(combined_mask, mask)
 
-        k = min(num_clusters, max(1, len(pixels) // 20))
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 15, 1.0)
-        _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+        pixel_count = cv2.countNonZero(combined_mask)
+        coverage = (pixel_count / total_pixels) * 100
 
-        counts = np.bincount(labels.flatten(), minlength=k)
-        total = max(1, int(np.sum(counts)))
-        detected = []
-
-        for idx, center in enumerate(centers):
-            b, g, r = int(center[0]), int(center[1]), int(center[2])
-            coverage = float((counts[idx] / total) * 100)
-            if coverage < 1.5:
-                continue
-
-            hsv = cv2.cvtColor(np.uint8([[[b, g, r]]]), cv2.COLOR_BGR2HSV)[0][0]
-            if int(hsv[1]) < 30:
-                continue
-
-            hex_code = f"#{r:02x}{g:02x}{b:02x}"
+        # Ignore tiny speckles (< 0.08% of total area)
+        if coverage > 0.08:
             detected.append({
-                "label": f"{get_color_name((r, g, b))} ({hex_code}) {coverage:.1f}%",
-                "hsv": (int(hsv[0]), int(hsv[1]), int(hsv[2])),
-                "hex": hex_code,
+                "label": f"{name} ({coverage:.2f}% area)",
+                "name": name,
+                "mask": combined_mask,
             })
 
-        return detected
-    except Exception:
-        return []
+    return detected
 
 
-def detect_parts_safe(image, chosen_colors):
-    h, w = image.shape[:2]
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+def detect_parts_from_masks(chosen_colors, image_shape):
+    h, w = image_shape[:2]
     combined = np.zeros((h, w), dtype=np.uint8)
 
-    for color in chosen_colors:
-        h_val, s_val, v_val = color["hsv"]
-        lower = np.array([max(0, h_val - 16), max(25, s_val - 70), max(25, v_val - 70)], dtype=np.uint8)
-        upper = np.array([min(179, h_val + 16), 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        combined = cv2.bitwise_or(combined, mask)
+    for color_info in chosen_colors:
+        combined = cv2.bitwise_or(combined, color_info["mask"])
 
     clean_mask = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
 
     parts = []
-    min_area = max(60, int(h * w * 0.0001))
+    min_area = max(40, int(h * w * 0.0001))
 
     for i in range(1, num_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -110,7 +86,7 @@ def detect_parts_safe(image, chosen_colors):
 
         comp = (labels == i).astype(np.uint8) * 255
         ys, xs = np.where(comp > 0)
-        if len(xs) < 15:
+        if len(xs) < 10:
             continue
 
         base_y = float(np.max(ys))
@@ -136,7 +112,6 @@ def detect_parts_safe(image, chosen_colors):
 
 
 def classify_body_parts(parts, image_shape):
-    """Sorts detected components into body regions based on spatial layout."""
     h, _ = image_shape[:2]
     rigged = {"head": [], "torso": [], "arms": [], "legs": []}
 
@@ -167,18 +142,13 @@ def animate_frame_elastic(original, parts, motion_type, frame_index, total_frame
 
     rigged = classify_body_parts(parts, (h, w))
 
-    # ============================================================
-    # 1. ADVANCED WALK CYCLE (Translational + Phase-Opposed Limbs)
-    # ============================================================
     if motion_type == "Advanced Walk":
-        # Global Horizontal Shift & Vertical Hip Bobbing
         stride_shift = (float(frame_index) / total_frames) * (w * 0.12)
         vertical_bob = abs(math.sin(phase * 2.0)) * (intensity * 0.4)
 
         map_x -= stride_shift
         map_y += vertical_bob
 
-        # Alternating Legs
         for idx, leg in enumerate(rigged["legs"]):
             mask = leg["mask"]
             bx, by = leg["base"]
@@ -192,7 +162,6 @@ def animate_frame_elastic(original, parts, motion_type, frame_index, total_frame
             map_x[mask] -= dx[mask]
             map_y[mask] -= dy[mask]
 
-        # Arm Opposition (Counter-swinging)
         for idx, arm in enumerate(rigged["arms"]):
             mask = arm["mask"]
             bx, by = arm["base"]
@@ -204,14 +173,10 @@ def animate_frame_elastic(original, parts, motion_type, frame_index, total_frame
             dx = math.sin(arm_phase) * (intensity * 1.2) * weight
             map_x[mask] -= dx[mask]
 
-    # ============================================================
-    # 2. BELLY LAUGH (Multi-Frequency Tremor + Chest Expansion)
-    # ============================================================
     elif motion_type == "Belly Laugh":
         fast_tremor = math.sin(phase * 6.0) * (intensity * 0.5)
         slow_nod = math.sin(phase) * (intensity * 0.3)
 
-        # Torso / Chest Vibration
         for torso in rigged["torso"]:
             mask = torso["mask"]
             cx, cy = torso["center"]
@@ -223,7 +188,6 @@ def animate_frame_elastic(original, parts, motion_type, frame_index, total_frame
             map_x[mask] -= dx[mask]
             map_y[mask] -= dy[mask]
 
-        # Head Pitching Backwards & Nodding
         for head in rigged["head"]:
             mask = head["mask"]
             bx, by = head["base"]
@@ -237,7 +201,6 @@ def animate_frame_elastic(original, parts, motion_type, frame_index, total_frame
             map_x[mask] -= dx[mask]
             map_y[mask] -= dy[mask]
 
-    # Standard Deformations
     else:
         for idx, part in enumerate(parts):
             mask = part["mask"]
@@ -326,10 +289,10 @@ ALL_MOTIONS = [
 ]
 
 # ============================================================
-# STREAMLIT UI
+# STREAMLIT INTERFACE
 # ============================================================
 
-uploaded_file = st.file_uploader("Upload hand-drawn character", type=["jpg", "jpeg", "png", "webp"])
+uploaded_file = st.file_uploader("Upload character drawing", type=["jpg", "jpeg", "png", "webp"])
 
 if uploaded_file is not None:
     try:
@@ -345,56 +308,55 @@ if uploaded_file is not None:
             scale = 1000.0 / max(h, w)
             img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-        detected_colors = extract_dominant_colors(img)
+        detected_colors = extract_accurate_colors(img)
 
         st.sidebar.header("Controls")
         chosen_colors = []
         if detected_colors:
             color_dict = {c["label"]: c for c in detected_colors}
             selected_labels = st.sidebar.multiselect(
-                "Colors to Animate",
+                "Marker Colors to Animate",
                 list(color_dict.keys()),
                 default=[list(color_dict.keys())[0]],
             )
             chosen_colors = [color_dict[lbl] for lbl in selected_labels]
         else:
-            st.sidebar.info("No distinct marker colors detected.")
+            st.sidebar.warning("No distinct marker colors detected.")
 
         intensity = float(st.sidebar.slider("Motion Strength", 4, 30, 12))
 
-        parts = detect_parts_safe(img, chosen_colors) if chosen_colors else []
+        parts = detect_parts_from_masks(chosen_colors, img.shape) if chosen_colors else []
         classified = classify_body_parts(parts, img.shape) if parts else {}
 
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Original Image")
-            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with col2:
             st.subheader(f"Rigged Skeleton ({len(parts)} regions detected)")
             preview = img.copy()
 
-            # Color-coded skeletal visualization
-            colors = {
-                "head": (255, 0, 0),    # Blue
-                "torso": (0, 255, 255), # Yellow
-                "arms": (0, 255, 0),    # Green
-                "legs": (0, 0, 255),    # Red
+            colors_map = {
+                "head": (255, 0, 0),
+                "torso": (0, 255, 255),
+                "arms": (0, 255, 0),
+                "legs": (0, 0, 255),
             }
 
             for group, group_parts in classified.items():
                 for p in group_parts:
-                    cv2.circle(preview, (int(p["base"][0]), int(p["base"][1])), 6, colors[group], -1)
+                    cv2.circle(preview, (int(p["base"][0]), int(p["base"][1])), 6, colors_map[group], -1)
                     cv2.circle(preview, (int(p["tip"][0]), int(p["tip"][1])), 4, (255, 255, 255), -1)
                     cv2.line(
                         preview,
                         (int(p["base"][0]), int(p["base"][1])),
                         (int(p["tip"][0]), int(p["tip"][1])),
-                        colors[group],
+                        colors_map[group],
                         2,
                     )
 
-            st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB))
+            st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB), use_container_width=True)
             st.caption("🔵 Head | 🟡 Torso | 🟢 Arms | 🔴 Legs")
 
         st.markdown("---")
@@ -403,12 +365,12 @@ if uploaded_file is not None:
         with btn_col1:
             generate_all = st.button("✨ Generate All Motions", type="primary", disabled=(len(parts) == 0))
         with btn_col2:
-            single_motion = st.selectbox("Select Motion to Render:", ALL_MOTIONS)
+            single_motion = st.selectbox("Select Single Motion:", ALL_MOTIONS)
             generate_single = st.button(f"Render '{single_motion}'", disabled=(len(parts) == 0))
 
         # Render All
         if generate_all:
-            progress = st.progress(0, text="Processing multi-region kinematics...")
+            progress = st.progress(0, text="Rendering animations...")
             results = []
 
             for idx, motion_name in enumerate(ALL_MOTIONS):
@@ -422,24 +384,20 @@ if uploaded_file is not None:
                 progress.progress((idx + 1) / len(ALL_MOTIONS))
 
             progress.empty()
-            st.success("All motions rendered successfully!")
+            st.success("All motions generated!")
 
             for row_start in range(0, len(results), 3):
                 row_cols = st.columns(3)
                 for col_idx in range(3):
                     item_idx = row_start + col_idx
                     if item_idx < len(results):
-                        name, data = results[item_idx]
+                        name, gif_data = results[item_idx]
                         with row_cols[col_idx]:
                             st.markdown(f"#### {item_idx + 1}. {name}")
-                            b64 = base64.b64encode(data).decode("utf-8")
-                            st.markdown(
-                                f'<img src="data:image/gif;base64,{b64}" style="width: 100%; border-radius: 8px; margin-bottom: 8px;">',
-                                unsafe_allow_html=True,
-                            )
+                            st.image(gif_data, use_container_width=True)
                             st.download_button(
                                 f"Download {name}",
-                                data=data,
+                                data=gif_data,
                                 file_name=f"{name.lower().replace(' ', '_')}.gif",
                                 mime="image/gif",
                                 key=f"dl_{item_idx}",
@@ -456,11 +414,7 @@ if uploaded_file is not None:
                 gif_bytes = build_gif(frames, duration=50)
 
             st.subheader(f"Result: {single_motion}")
-            b64 = base64.b64encode(gif_bytes).decode("utf-8")
-            st.markdown(
-                f'<img src="data:image/gif;base64,{b64}" style="max-width: 600px; border-radius: 8px; margin-bottom: 8px;">',
-                unsafe_allow_html=True,
-            )
+            st.image(gif_bytes, width=500)
             st.download_button(
                 f"Download {single_motion} GIF",
                 data=gif_bytes,
